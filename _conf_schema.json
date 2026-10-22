@@ -1,0 +1,20 @@
+{
+  "provider_id": {
+    "description": "寫開場白用的模型",
+    "type": "string",
+    "_special": "select_provider",
+    "hint": "留空用 AstrBot 預設模型",
+    "default": ""
+  },
+  "persona_id": {
+    "description": "機器人用的人格 ID",
+    "type": "string",
+    "hint": "寫東西時套用這個人格的提示詞，口吻和聊天一致。留空用 AstrBot 預設人格",
+    "default": ""
+  },
+  "owner_qq": {
+    "description": "主人 QQ（留空用門禁插件裡填的）",
+    "type": "list",
+    "default": []
+  }
+}

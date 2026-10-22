@@ -1,0 +1,9 @@
+name: astrbot_plugin_lively_proactive
+display_name: 主動私聊
+desc: 偶爾主動私聊有過交互、好感夠的熟人，沒回就不再打擾
+version: 2.0.0
+author: GUCine
+repo: https://github.com/GUCine/astrbot_plugin_lively_proactive
+support_platforms:
+  - aiocqhttp
+astrbot_version: ">=4.29.0"
