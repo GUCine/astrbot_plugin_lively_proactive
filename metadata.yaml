@@ -8,6 +8,7 @@ repo: https://github.com/GUCine/astrbot_plugin_lively_proactive
 support_platforms:
   - aiocqhttp
 astrbot_version: ">=4.29.0"
+category: 娱乐
 tags:
   - 主動聊天
   - 私聊
