@@ -1,12 +1,15 @@
 """機器人偶爾主動私聊熟人。
 
-只找：QQ 好友 + 和機器人直接聊過幾次 + 好感不低 + 最近兩天沒聊過的人
-不煩人：只在白天和晚上的幾個時段；每天最多 DAILY_MAX 次；同一個人隔幾天才找一次；
+只找：QQ 好友 + 和機器人直接聊過幾次 + 好感度到「親近」、態度正常、沒說過嫌〈我〉煩（問 bond 的關係讀口 can_reach）+ 最近兩天沒聊過的人
+不煩人：只在白天和晚上的幾個時段；每天最多 DAILY_MAX 次；同一個人隔幾天才找一次（心跳私聊開新話題、加好友打招呼也算找過，
+        都記在 bond 的 reach，看 last_reach）；
         上次主動找 TA 沒回就隔更久，連著兩次沒回就不再主動找，等 TA 自己來
 開口前先讓模型判斷有沒有合適的由頭，沒有就不發
 發出去的話寫進 TA 的私聊記錄，TA 回覆時機器人記得自己說過什麼
 
-主人私信指令：主動聊天 狀態 / 開 / 關 / 預覽 / 自動 / 試一下，別主動找 QQ，可以找 QQ
+主人私信指令：主動聊天 狀態 / 開 / 關 / 預覽 / 自動 / 試一下（回覆是【后台】白話，不用她的口吻）
+預覽模式下她寫的開場白連同【后台】說明私信主人，記成後台的事
+不主動找某個人：面板〈卡〉的規矩頁「不要主动找 TA 聊天」（10-26 拿掉了「別主動找 QQ／可以找 QQ」指令）
 """
 import asyncio
 import json
@@ -23,7 +26,7 @@ from astrbot.api import AstrBotConfig
 from astrbot.api.star import Context, Star, StarTools, register
 from astrbot.core.message.message_event_result import MessageChain
 
-from .lively_common import Settings, T2S, plugin_data_dir
+from .lively_common import Settings, T2S, backstage, note_outbox, pick_final, plugin_data_dir
 
 TZ = timezone(timedelta(hours=8))
 WINDOWS = [("10:30", "12:00"), ("15:00", "17:30"), ("19:30", "22:00")]
@@ -31,7 +34,7 @@ CHECK_EVERY = 600  # 每 10 分鐘看一次
 CHANCE = 0.2  # 時段內每次檢查有這麼大概率去找人（每天大約觸發幾次，受 DAILY_MAX 限制）
 DAILY_MAX = 2
 MIN_TALKS = 2
-MIN_FAVOR = 5
+OLD_MIN_FAVOR = 5  # 舊版 bond 沒有關係讀口時，照舊看舊好感
 QUIET_DAYS = 2  # 最近這麼多天聊過的不找
 STALE_DAYS = 30  # 太久沒聯繫的也不找（關係淡了）
 GAP_DAYS = 5  # 同一個人至少隔這麼多天
@@ -57,6 +60,7 @@ OPENER_RULE = """
 - 群聊摘要里有很多人，只挑和 TA 本人有关的事说，别把别人做的事安到 TA 头上
 - 现在是 {now}，别在不合时宜的时间说早安晚安
 - 如果实在找不到自然的由头，只回复「跳过」两个字
+- 只输出要发给 TA 的话本身，不要先写分析、情景、清单或「写：」这类草稿
 """
 
 
@@ -140,7 +144,7 @@ class LivelyProactive(Star):
             logger.warning(f"[lively_proactive] 拿好友列表失败: {e}")
             return set()
 
-    def _eligible(self, p: dict, now: float) -> tuple[bool, str]:
+    def _eligible(self, p: dict, now: float, quiet: set[str] = frozenset()) -> tuple[bool, str]:
         qq = p["qq"]
         if self.s.is_owner(qq):
             return False, "主人"
@@ -148,8 +152,10 @@ class LivelyProactive(Star):
             return False, "主人说别找"
         if (p["talks"] or 0) < MIN_TALKS:
             return False, "聊得太少"
-        if (p["favor"] or 0) < MIN_FAVOR:
-            return False, "好感不够"
+        if not p.get("can_reach", True):
+            return False, p.get("reach_why") or "好感度不够"
+        if qq in quiet or p.get("quiet"):  # 程式替她抽人時不抽嫌煩的（她自己找不攔，10-30）
+            return False, "TA 嫌〈我〉烦"
         last_talk = p["last_talk"] or 0
         if now - last_talk < QUIET_DAYS * 86400:
             return False, "最近刚聊过"
@@ -162,24 +168,47 @@ class LivelyProactive(Star):
         if unanswered >= STOP_AFTER_UNANSWERED:
             return False, "主动找了两次都没回"
         gap = GAP_DAYS_UNANSWERED if unanswered else GAP_DAYS
-        if now - h.get("last", 0) < gap * 86400:
+        if now - max(h.get("last", 0), p.get("last_reach") or 0) < gap * 86400:
             return False, "前几天刚主动找过"
         return True, ""
 
-    async def candidates(self) -> tuple[list[dict], dict]:
-        friends = await self._friends()
+    def _star(self, short: str):
+        meta = self.context.get_registered_star(f"astrbot_plugin_{short}")
+        return getattr(meta, "star_cls", None) if meta and getattr(meta, "activated", True) else None
+
+    def _people(self) -> list[dict]:
+        """bond 的關係讀口；舊版 bond 才自己讀 bond.db、看舊好感"""
+        b = self._star("lively_bond")
+        if b and hasattr(b, "relations"):
+            return [r for r in b.relations() if r["known"]]
         con = _ro(self.data / "astrbot_plugin_lively_bond" / "bond.db")
         con.row_factory = sqlite3.Row
         rows = [dict(r) for r in con.execute(
             "select qq, name, familiarity, favor, impression, last_talk, talks from people")]
         con.close()
+        for r in rows:
+            r["score"] = r["favor"] or 0
+            r["can_reach"], r["reach_why"] = r["score"] >= OLD_MIN_FAVOR, "好感不够"
+        return rows
+
+    def _quiet(self) -> set[str]:
+        m = self._star("lively_mind")
+        try:
+            return set(m.quiet_people()) if m and hasattr(m, "quiet_people") else set()
+        except Exception:
+            return set()
+
+    async def candidates(self) -> tuple[list[dict], dict]:
+        friends = await self._friends()
+        rows = self._people()
+        quiet = self._quiet()
         now = time.time()
         ok, why = [], {}
         for p in rows:
             if p["qq"] not in friends:
                 why["不是好友"] = why.get("不是好友", 0) + 1
                 continue
-            good, reason = self._eligible(p, now)
+            good, reason = self._eligible(p, now, quiet)
             if good:
                 ok.append(p)
             else:
@@ -216,7 +245,9 @@ class LivelyProactive(Star):
                 m = json.loads(meta or "{}")
                 if m.get("status") != "active":
                     continue
-                if qq in str(m.get("participant_identities")) or name in str(m.get("participants")):
+                # 號碼、名字都要完全相等：子字串會把「12345」配上「123456789」、一個字的名字配上一堆人
+                ids = {str(i.get("sender_id") or "") for i in m.get("participant_identities") or [] if isinstance(i, dict)}
+                if qq in ids or (not ids and name in (m.get("participants") or [])):
                     mem.append((m.get("canonical_summary") or text)[:150])
                 if len(mem) >= 3:
                     break
@@ -243,7 +274,10 @@ class LivelyProactive(Star):
         )
         text = (getattr(resp, "completion_text", "") or "").strip()
         text = re.sub(r"(?:<<|《《|＜＜)[^\n]*", "", text)  # 萬一帶了好感標記
-        text = re.sub(r"&&[^&]*&&", "", text).replace("。", "").strip()
+        final = pick_final(text)  # 把起草稿寫成正文了：挑出終稿，挑不出來這次不找
+        if final != text:
+            logger.warning(f"[lively_proactive] 开场白像起草稿，{'挑出了终稿' if final else '这次不发'}:\n{text[:400]}")
+        text = re.sub(r"&&[^&]*&&", "", final or "").replace("。", "").strip()
         if not text or "跳过" in text[:4]:
             return None
         return text
@@ -255,10 +289,10 @@ class LivelyProactive(Star):
                 return "今天已经主动找够人了"
             cands, why = await self.candidates()
             if not cands:
-                return "现在没有合适的人可以找：" + "，".join(f"{k} {v}" for k, v in why.items())
+                return "现在没有能找的人：" + "，".join(f"{k} {v}" for k, v in why.items())
             # 熟一點、好感高一點、久一點沒聊的更容易被選中
             weights = [
-                (p["familiarity"] or 1) * max(p["favor"] or 1, 1) ** 0.5
+                (p["familiarity"] or 1) * max(p["score"] or 1, 1) ** 0.5
                 * min((time.time() - (p["last_talk"] or 0)) / 86400, 10)
                 for p in cands
             ]
@@ -267,16 +301,21 @@ class LivelyProactive(Star):
                 text = await self._write(p)
             except Exception as e:
                 logger.warning(f"[lively_proactive] 写开场白失败: {e}")
-                return "写开场白失败了"
+                return "写开场白时出错了"
             name = p["name"] or p["qq"]
             if not text:
                 self._log("skip", qq=p["qq"], name=name)
-                return f"想找 {name}，但没想到合适的话，先不打扰了"
+                return f"挑了 {name}，她没写开场白（觉得没有合适的由头），没发"
             if self.state["mode"] == "preview":
-                await self._tell_owner(f"〈我〉想主动找 {name}（{p['qq']}）说：\n{text}\n（预览模式，没有发出去）")
+                await self._tell_owner(backstage(f"预览模式，没发出去：她想主动找 {name}（QQ {p['qq']}）说的话是\n{text}"))
                 self._log("preview", qq=p["qq"], name=name, text=text)
-                return f"已把给 {name} 的草稿发给主人看"
+                return f"给 {name} 的开场白发给主人看了，没发出去"
             await self._send(p["qq"], text)
+            if (b := self._star("lively_bond")) and hasattr(b, "note_reach"):
+                try:
+                    b.note_reach(p["qq"], "proactive")
+                except Exception as e:
+                    logger.warning(f"[lively_proactive] 记主动找人失败: {e}")
             self.state["count"] = self._today_count() + 1
             h = self.state["people"].setdefault(p["qq"], {})
             answered = h.get("replied", True) or (p["last_talk"] or 0) > h.get("last", 0)
@@ -313,13 +352,18 @@ class LivelyProactive(Star):
             await self.context.send_message(self.s.private_umo(self.s.owner()), MessageChain().message(self.s.owner_text(text)))
         except Exception as e:
             logger.error(f"[lively_proactive] 私信主人失败: {e}")
+            return
+        note_outbox(self.s.private_umo(self.s.owner()), self.s.fill(text), "后台:主动私聊")
 
     async def _loop(self):
         await asyncio.sleep(120)
         while True:
             try:
                 now = datetime.now(TZ)
-                if (
+                m = self._star("lively_mind")
+                if m and hasattr(m, "reach_in_heartbeat") and m.reach_in_heartbeat():
+                    pass  # 10-26 起交給心跳：她看手機時自己看要不要找誰，這裡不再隨機抽人
+                elif (
                     self.state["enabled"]
                     and _in_window(now)
                     and self._today_count() < _tune("proactive.daily_max", DAILY_MAX)
@@ -336,6 +380,8 @@ class LivelyProactive(Star):
     # ---------- 回覆跟蹤 + 主人指令 ----------
     @filter.event_message_type(filter.EventMessageType.PRIVATE_MESSAGE, priority=1400)
     async def on_dm(self, event: AstrMessageEvent):
+        if event.get_extra("lively_beat"):  # 〈我〉看手機時想私聊 TA 的內部消息：不是 TA 回了
+            return
         qq = str(event.get_sender_id() or "")
         h = self.state["people"].get(qq)
         if h and not h.get("replied", True):
@@ -346,41 +392,32 @@ class LivelyProactive(Star):
             return
         text = (event.message_str or "").strip().translate(T2S)
         reply = None
-        m = re.match(r"^(别主动找|可以找)\s*(\d{5,12})$", text)
-        if m:
-            target = m.group(2)
-            if m.group(1) == "别主动找":
-                if target not in self.state["blocked"]:
-                    self.state["blocked"].append(target)
-                reply = f"好，以后不主动找 {target} 了"
-            else:
-                if target in self.state["blocked"]:
-                    self.state["blocked"].remove(target)
-                reply = f"好，{target} 又可以主动找了"
-            self._save()
-        elif text.startswith("主动聊天"):
+        if text.startswith("主动聊天"):
             arg = text[4:].strip()
             if arg in ("开", "开启"):
                 self.state["enabled"] = True
-                reply = "主动聊天开啦"
+                reply = "主动聊天：开了"
             elif arg in ("关", "关闭"):
                 self.state["enabled"] = False
-                reply = "主动聊天关掉了，〈我〉乖乖等别人来找"
+                reply = "主动聊天：关了，不再定时找人"
             elif arg == "预览":
                 self.state["mode"] = "preview"
-                reply = "以后想主动找人时，先把草稿发给〈主人〉看，不直接发"
+                reply = "主动聊天：预览模式，她写的开场白先发给你看，不发出去"
             elif arg == "自动":
                 self.state["mode"] = "auto"
-                reply = "以后直接发啦"
+                reply = "主动聊天：自动模式，她写的开场白直接发"
             elif arg in ("试一下", "试试"):
                 reply = await self.reach_out(force=True)
             elif arg in ("", "状态"):
                 cands, why = await self.candidates()
                 names = "、".join((p["name"] or p["qq"]) for p in cands[:10]) or "暂时没有"
+                m = self._star("lively_mind")
+                hb = bool(m and hasattr(m, "reach_in_heartbeat") and m.reach_in_heartbeat())
                 reply = (
-                    f"主动聊天：{'开' if self.state['enabled'] else '关'}，"
+                    ("现在交给心跳了：她看 QQ 时自己看要不要找谁、找几个，这里不再随机抽人；「试一下」还能用\n" if hb else "")
+                    + f"主动聊天：{'开' if self.state['enabled'] else '关'}，"
                     f"{'预览' if self.state['mode'] == 'preview' else '自动'}模式，"
-                    f"今天找了 {self._today_count()}/{_tune("proactive.daily_max", DAILY_MAX)} 次\n"
+                    f"今天找了 {self._today_count()}/{_tune('proactive.daily_max', DAILY_MAX)} 次\n"
                     f"现在可以找的：{names}\n"
                     f"不能找的原因：" + "，".join(f"{k} {v}" for k, v in why.items())
                 )
@@ -388,4 +425,4 @@ class LivelyProactive(Star):
                 self._save()
         if reply is not None:
             event.stop_event()
-            await event.send(MessageChain().message(self.s.owner_text(reply)))
+            await event.send(MessageChain().message(self.s.admin_text(reply)))
